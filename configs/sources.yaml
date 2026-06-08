@@ -1,0 +1,45 @@
+fish_market_report:
+  display_name: "Рыбные ряды / НАЦРЫБРЕСУРС"
+  source_type: "pdf"
+  document_profile: "fish_market_report"
+  description: "Еженедельный обзор ситуации на рынке рыбы"
+  expected_sections:
+    - catch_main_species
+    - wholesale_far_east
+    - wholesale_north_west
+    - wholesale_center
+    - export_market_prices
+    - retail_frozen_fish
+  target_fields:
+    - section_name
+    - indicator
+    - commodity
+    - region
+    - route
+    - date
+    - value
+    - unit
+    - currency
+    - evidence_text
+  update_frequency: "weekly"
+  extraction_strategy: "profile_parser"
+  requires_ocr: false
+  uses_llm: false
+
+generic_pdf:
+  display_name: "Универсальный PDF"
+  source_type: "pdf"
+  document_profile: "generic_pdf"
+  description: "Базовое извлечение текста и таблиц из PDF"
+  extraction_strategy: "pdfplumber"
+  requires_ocr: false
+  uses_llm: false
+
+generic_table:
+  display_name: "Универсальная таблица CSV/XLSX"
+  source_type: "table"
+  document_profile: "generic_table"
+  description: "Базовая обработка CSV/XLSX с нормализацией и валидацией"
+  extraction_strategy: "pandas"
+  requires_ocr: false
+  uses_llm: false

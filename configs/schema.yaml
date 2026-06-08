@@ -1,0 +1,29 @@
+standard_columns:
+  - source_file
+  - source_type
+  - page
+  - sheet
+  - row_id
+  - table_id
+  - row_index_in_table
+  - section_name
+  - indicator
+  - commodity
+  - region
+  - route
+  - date
+  - value
+  - unit
+  - currency
+  - evidence_text
+  - bbox
+  - extraction_method
+  - extraction_level
+  - text_layer_quality
+  - text_layer_warning
+  - confidence
+
+validation_columns:
+  - validation_status
+  - warnings
+  - review_status

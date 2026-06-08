@@ -1,0 +1,57 @@
+profile_name: mmtp_tariffs
+display_name: Тарифы ММТП
+document_match:
+  keywords: []
+extraction:
+  source: ocr
+  ocr:
+    required: true
+    engine: tesseract
+    lang: rus+eng
+    pages: auto
+    dpi: 300
+blocks:
+- selector: &id002
+    block_uids:
+    - ocr_candidate:2:ocr_p2_fallback
+    - ocr_candidate:3:ocr_p3_fallback
+  row_selection: &id003
+    use_manual_rows: true
+    selected_source_rows: &id001
+    - ocr_candidate:2:ocr_p2_fallback:row:15
+    - ocr_candidate:2:ocr_p2_fallback:row:17
+    - ocr_candidate:2:ocr_p2_fallback:row:18
+    keep_after: ''
+    keep_until: ''
+    keep_numeric_rows_only: false
+    skip_empty_values: true
+    skip_dash_values: true
+    selected_row_uids: *id001
+  table_reconstruction: &id004
+    method: none
+  column_mapping: &id005
+    column_1:
+      role: code
+      output_field: code
+    column_2:
+      role: name
+      output_field: name
+    column_3:
+      role: unit
+      output_field: unit
+  source_kind: ocr_candidate
+tables:
+- section_name: user_profile_section
+  table_selector: *id002
+  row_filters: *id003
+  table_reconstruction: *id004
+  column_mapping: *id005
+  token_mapping: {}
+normalization:
+  number_format: ru
+  dash_as_null: true
+validation:
+  required_fields:
+  - name
+  - value
+  value_positive: true

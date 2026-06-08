@@ -1,0 +1,99 @@
+profile_name: nmpt_tariffs
+display_name: Тарифы НМТП
+document_match:
+  keywords: []
+extraction:
+  source: mixed
+  primary: pdfplumber
+  fallback: tesseract
+  pdf_engine: pdfplumber
+  ocr:
+    required: false
+    engine: tesseract
+    lang: rus+eng
+    pages: auto
+    dpi: 300
+blocks:
+- selector: &id002
+    block_uids:
+    - ocr_candidate:17:ocr_p17_b1
+  row_selection: &id003
+    use_manual_rows: true
+    selected_source_rows: &id001
+    - ocr_candidate:17:ocr_p17_b1:row:2
+    - ocr_candidate:17:ocr_p17_b1:row:3
+    keep_after: ''
+    keep_until: ''
+    keep_numeric_rows_only: false
+    skip_empty_values: true
+    skip_dash_values: true
+    selected_row_uids: *id001
+  table_reconstruction: &id004
+    method: split_by_regex
+    pattern: \s{1,}|\|
+  column_mapping: &id005
+    column_1:
+      role: code
+      output_field: code
+    column_2:
+      role: name
+      output_field: name
+    column_3:
+      role: unit
+      output_field: unit
+    column_4:
+      role: value
+      output_field: value
+      metric: tariff
+      scenario: direct
+      tariff_type: direct
+      value_type: numeric
+      year: null
+      unit_override: null
+      currency_override: null
+    column_5:
+      role: value
+      output_field: value
+      metric: tariff
+      scenario: intraport_movement
+      tariff_type: intraport_movement
+      value_type: numeric
+      year: null
+      unit_override: null
+      currency_override: null
+    column_6:
+      role: ignore
+      output_field: ''
+    column_7:
+      role: ignore
+      output_field: ''
+    column_8:
+      role: ignore
+      output_field: ''
+    column_9:
+      role: ignore
+      output_field: ''
+    column_10:
+      role: ignore
+      output_field: ''
+    column_11:
+      role: ignore
+      output_field: ''
+    column_12:
+      role: ignore
+      output_field: ''
+tables:
+- section_name: user_profile_section
+  table_selector: *id002
+  row_filters: *id003
+  table_reconstruction: *id004
+  column_mapping: *id005
+  token_mapping: {}
+normalization:
+  number_format: ru
+  dash_as_null: true
+validation:
+  required_fields:
+  - name
+  - value
+  value_positive: true
