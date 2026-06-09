@@ -375,7 +375,28 @@ def select_source_rows(
     selector = table_selector or {}
     source_rows = source_rows_from_frames(raw_rows, ocr_candidates_df)
     table_ids = {str(value) for value in selector.get("table_ids") or [] if str(value)}
-    block_uids = {str(value) for value in selector.get("block_uids") or [] if str(value)}
+    block_uids = [str(value) for value in selector.get("block_uids") or [] if str(value)]
+    
+    target_raw_uids = []
+    target_ocr_uids = []
+    
+    for uid in block_uids:
+        if uid.startswith("raw_table:"):
+            parts = uid.split(":", 2)
+            if len(parts) == 3:
+                target_raw_uids.append(parts[2])
+            else:
+                target_raw_uids.append(uid)
+        elif uid.startswith("ocr_candidate:"):
+            parts = uid.split(":", 2)
+            if len(parts) == 3:
+                target_ocr_uids.append(parts[2])
+            else:
+                target_ocr_uids.append(uid)
+        else:
+            target_raw_uids.append(uid)
+            target_ocr_uids.append(uid)
+
     source_kind = normalize_source_kind(selector.get("source_kind"))
     page_contains = normalize_text(selector.get("page_contains"))
     text_contains_values = selector.get("text_contains")
@@ -383,8 +404,29 @@ def select_source_rows(
         text_contains_values = [text_contains_values]
     text_contains_values = [normalize_text(value) for value in text_contains_values]
     text_contains_values = [value for value in text_contains_values if value]
-    if table_ids or block_uids or source_kind or page_contains:
-        source_rows = [row for row in source_rows if _selector_matches(row, {**selector, "text_contains": None})]
+    
+    filtered_rows = []
+    for row in source_rows:
+        row_source_kind = str(row.get("source_kind") or "")
+        
+        # Exact block/table ID matching bypasses other filters
+        if block_uids or table_ids:
+            if row_source_kind == "raw_table" and str(row.get("table_id") or "") in target_raw_uids:
+                filtered_rows.append(row)
+                continue
+            if row_source_kind == "ocr_candidate" and str(row.get("ocr_block_id") or "") in target_ocr_uids:
+                filtered_rows.append(row)
+                continue
+            if str(row.get("table_id") or "") in table_ids:
+                filtered_rows.append(row)
+                continue
+        
+        # Regular selector matching
+        if _selector_matches(row, {**selector, "text_contains": None}):
+            filtered_rows.append(row)
+
+    source_rows = filtered_rows
+
     if text_contains_values:
         table_text: dict[tuple[str, str], list[str]] = {}
         for row in source_rows:
@@ -555,6 +597,27 @@ def source_rows_to_preview_df(source_rows: list[dict[str, Any]], limit: int = 50
     return pd.DataFrame(rows, columns=column_names)
 
 
+RECONSTRUCTION_CODE_PATTERN = re.compile(r"^\s*(\d+(?:\.\d+)+\.?|\d+\.)\s+(.+)")
+RECONSTRUCTION_STRICT_CODE_PATTERN = re.compile(r"^\s*(\d+(?:\.\d+)+\.?)\s*$|^\s*(\d+\.)\s*$")
+
+
+def _is_reconstruction_code_only(text: str) -> bool:
+    return bool(RECONSTRUCTION_STRICT_CODE_PATTERN.match(text))
+
+
+def _extract_reconstruction_name_and_code(text: str) -> tuple[str | None, str | None]:
+    match = RECONSTRUCTION_CODE_PATTERN.match(text)
+    if match:
+        return match.group(1).strip("."), match.group(2).strip()
+    return None, None
+
+
+def _is_reconstruction_unit_only(text: str) -> bool:
+    units = {"тн", "т", "сут", "тн/сут", "руб", "кг", "тонн", "тонна"}
+    clean = text.strip().lower()
+    return (clean in units or any(u in clean for u in units)) and not any(c.isdigit() for c in clean)
+
+
 def apply_table_reconstruction(
     source_rows: list[dict[str, Any]],
     table_reconstruction: dict[str, Any] | None = None,
@@ -564,6 +627,83 @@ def apply_table_reconstruction(
     method = str(reconstruction.get("method") or "none").strip()
     if method in {"", "none"}:
         return list(source_rows)
+
+    if method == "pair_name_row_with_following_value_row":
+        rebuilt_rows: list[dict[str, Any]] = []
+        i = 0
+        paired_rows_count = 0
+        support_rows_included = []
+        
+        while i < len(source_rows):
+            current_row = source_rows[i]
+            text = str(current_row.get("evidence_text") or "").strip()
+            code, name = _extract_reconstruction_name_and_code(text)
+
+            if code and name:
+                j = i + 1
+                value = None
+                unit = None
+                consumed_indices = [i]
+
+                while j < len(source_rows):
+                    next_row = source_rows[j]
+                    next_text = str(next_row.get("evidence_text") or "").strip()
+
+                    n_code, n_name = _extract_reconstruction_name_and_code(next_text)
+                    if n_code and n_name:
+                        break
+
+                    if _is_reconstruction_code_only(next_text):
+                        break
+
+                    tokens = next_row.get("numeric_tokens") or []
+                    non_code_tokens = [t for t in tokens if not _is_reconstruction_code_only(t)]
+
+                    if non_code_tokens:
+                        value = non_code_tokens[0]
+                        consumed_indices.append(j)
+                        break
+
+                    if _is_reconstruction_unit_only(next_text):
+                        unit = next_text
+                        consumed_indices.append(j)
+
+                    j += 1
+
+                if value is not None:
+                    rebuilt = dict(current_row)
+                    rebuilt["cells"] = [code, name, value, unit or ""]
+                    rebuilt["evidence_text"] = " | ".join(
+                        str(source_rows[idx].get("evidence_text") or "") for idx in consumed_indices
+                    )
+                    rebuilt["numeric_tokens"] = [value]
+                    rebuilt["text_part"] = name
+                    rebuilt["reconstructed_code"] = code
+                    rebuilt["reconstructed_name"] = name
+                    rebuilt["reconstructed_unit"] = unit
+                    
+                    rebuilt_uids = [
+                        str(source_rows[idx].get("row_uid") or source_row_uid(source_rows[idx])) for idx in consumed_indices
+                    ]
+                    rebuilt["reconstructed_from_ids"] = rebuilt_uids
+                    rebuilt["table_reconstruction_method"] = method
+                    rebuilt_rows.append(rebuilt)
+                    
+                    paired_rows_count += 1
+                    support_rows_included.extend(rebuilt_uids[1:])
+                    
+                    i = j + 1 if j >= i + 1 else i + 1
+                else:
+                    rebuilt_rows.append(current_row)
+                    i += 1
+            else:
+                rebuilt_rows.append(current_row)
+                i += 1
+                
+        # Attach diagnostics to result metadata if possible (or just return rows)
+        # Note: we return a list, but we can store diag in the first row if needed.
+        # But a better way is to rely on reconstruction_from_ids for selection.
+        return rebuilt_rows
 
     if method != "split_by_regex":
         return list(source_rows)
@@ -596,6 +736,11 @@ def _source_row_selection_keys(source_row: dict[str, Any]) -> set[str]:
     keys: set[str] = {source_row_uid(source_row)}
     if source_row.get("row_uid"):
         keys.add(str(source_row.get("row_uid")))
+
+    for from_id in source_row.get("reconstructed_from_ids") or []:
+        if from_id:
+            keys.add(str(from_id))
+
     for column in ["source_row_id", "row_index_in_table"]:
         value = source_row.get(column)
         if is_missing(value):
@@ -1035,13 +1180,48 @@ def apply_user_profile_to_sources(
     output_rows: list[dict[str, Any]] = []
     row_id = 1
     application_config = _profile_config_for_application(profile_config)
-    for table_config in application_config.get("tables") or []:
+    
+    # Storage for diagnostics
+    diagnostics = {}
+    
+    for table_index, table_config in enumerate(application_config.get("tables") or []):
         table_selector = table_config.get("table_selector") or {}
         column_mapping = table_config.get("column_mapping") or {}
-        source_rows = select_source_rows(raw_rows, ocr_candidates_df, table_selector)
-        source_rows = apply_table_reconstruction(source_rows, table_config.get("table_reconstruction"))
-        source_rows = apply_row_filters(source_rows, table_config.get("row_filters") or [], column_mapping)
-        for source_row in source_rows:
+        
+        source_rows_block = select_source_rows(raw_rows, ocr_candidates_df, table_selector)
+        
+        reconstruction_config = table_config.get("table_reconstruction") or {}
+        recon_mode = str(reconstruction_config.get("method") or "none")
+        
+        reconstructed_rows = apply_table_reconstruction(source_rows_block, reconstruction_config)
+        
+        row_filters = table_config.get("row_filters") or []
+        filtered_source_rows = apply_row_filters(reconstructed_rows, row_filters, column_mapping)
+        
+        # Calculate diagnostics for this table
+        selected_keys = set()
+        filters = normalize_row_filters(row_filters)
+        for f in filters:
+            if f.get("type") == "manual_selected_rows":
+                selected_keys.update(f.get("selected_source_rows") or [])
+        
+        support_rows_included = []
+        for r in filtered_source_rows:
+            from_ids = r.get("reconstructed_from_ids") or []
+            if len(from_ids) > 1:
+                # First ID is anchor, rest are support
+                support_rows_included.extend(from_ids[1:])
+        
+        diagnostics[f"table_{table_index}"] = {
+            "reconstruction_mode": recon_mode,
+            "selected_anchor_row_uids": list(selected_keys),
+            "source_block_rows_count": len(source_rows_block),
+            "support_rows_included": list(set(support_rows_included)),
+            "reconstructed_rows_count": len(reconstructed_rows),
+            "rows_after_manual_selection": len(filtered_source_rows),
+        }
+        
+        for source_row in filtered_source_rows:
             rows = _token_mapping_rows_for_source_row(source_row, table_config, application_config, row_id)
             if not rows:
                 rows = _structured_rows_for_source_row(source_row, table_config, application_config, row_id)
@@ -1049,14 +1229,19 @@ def apply_user_profile_to_sources(
             row_id += len(rows)
 
     if not output_rows:
-        return pd.DataFrame(columns=USER_PROFILE_EXPORT_COLUMNS)
+        result = pd.DataFrame(columns=USER_PROFILE_EXPORT_COLUMNS)
+        result.attrs["profile_diagnostics"] = diagnostics
+        return result
+        
     result = ensure_standard_columns(pd.DataFrame(output_rows))
     for column in USER_PROFILE_EXTRA_COLUMNS:
         if column not in result.columns:
             result[column] = None
     ordered = [column for column in USER_PROFILE_EXPORT_COLUMNS if column in result.columns]
     extra = [column for column in result.columns if column not in ordered]
-    return result[ordered + extra].copy()
+    final_df = result[ordered + extra].copy()
+    final_df.attrs["profile_diagnostics"] = diagnostics
+    return final_df
 
 
 def _document_frame(document: Any, key: str, fallback: pd.DataFrame | None = None) -> pd.DataFrame:

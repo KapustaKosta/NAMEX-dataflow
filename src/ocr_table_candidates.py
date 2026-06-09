@@ -9,6 +9,7 @@ OCR_CANDIDATE_COLUMNS = [
     "source_file",
     "page",
     "ocr_block_id",
+    "ocr_engine",
     "block_title",
     "candidate_type",
     "block_text",
@@ -590,10 +591,9 @@ def extract_ocr_table_candidates(ocr_df: pd.DataFrame) -> pd.DataFrame:
         return _empty_candidates()
 
     rows = ocr_df.copy()
-    if "extraction_method" in rows.columns:
-        rows = rows[rows["extraction_method"].fillna("").astype(str).eq("tesseract_ocr")]
     if "extraction_level" in rows.columns:
         rows = rows[rows["extraction_level"].fillna("").astype(str).eq("raw_ocr")]
+    
     if rows.empty:
         return _empty_candidates()
 
@@ -607,6 +607,12 @@ def extract_ocr_table_candidates(ocr_df: pd.DataFrame) -> pd.DataFrame:
         page = row.get("page")
         evidence_text = str(row.get("evidence_text") or "")
         
+        # Determine engine prefix for extraction_method
+        raw_method = str(row.get("extraction_method") or "ocr")
+        engine_prefix = raw_method.replace("_ocr", "")
+        # Use ocr_engine if present, otherwise use engine_prefix
+        ocr_engine = row.get("ocr_engine") or engine_prefix
+        
         blocks = _extract_blocks_from_text(evidence_text)
         found_blocks = False
         
@@ -619,6 +625,7 @@ def extract_ocr_table_candidates(ocr_df: pd.DataFrame) -> pd.DataFrame:
                     "source_file": source_file,
                     "page": page,
                     "ocr_block_id": f"ocr_p{page}_b{block_index}",
+                    "ocr_engine": ocr_engine,
                     "block_title": title,
                     "candidate_type": analysis["candidate_type"],
                     "block_text": block_text,
@@ -629,7 +636,7 @@ def extract_ocr_table_candidates(ocr_df: pd.DataFrame) -> pd.DataFrame:
                     "information_score": analysis["information_score"],
                     "score": analysis["score"],
                     "reason": analysis["reason"],
-                    "extraction_method": "tesseract_ocr_candidate",
+                    "extraction_method": f"{engine_prefix}_ocr_candidate",
                     "extraction_level": "ocr_candidate",
                     "review_status": "needs_profile_setup",
                 }
@@ -648,6 +655,7 @@ def extract_ocr_table_candidates(ocr_df: pd.DataFrame) -> pd.DataFrame:
                     "source_file": source_file,
                     "page": page,
                     "ocr_block_id": f"ocr_p{page}_fallback",
+                    "ocr_engine": ocr_engine,
                     "block_title": f"OCR стр. {page} (fallback)",
                     "candidate_type": "paragraph",
                     "block_text": text,
@@ -657,8 +665,8 @@ def extract_ocr_table_candidates(ocr_df: pd.DataFrame) -> pd.DataFrame:
                     "table_score": 0.1,
                     "information_score": 0.4,
                     "score": fallback_score,
-                    "reason": "fallback: недостаточно структуры для выделения блоков, но текст содержит достаточно данных",
-                    "extraction_method": "tesseract_ocr_candidate_fallback",
+                    "reason": f"fallback ({ocr_engine}): недостаточно структуры для выделения блоков, но текст содержит данные",
+                    "extraction_method": f"{engine_prefix}_ocr_candidate_fallback",
                     "extraction_level": "ocr_candidate",
                     "review_status": "needs_profile_setup",
                 }

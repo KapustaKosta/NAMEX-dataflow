@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import time
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -1082,7 +1083,8 @@ def apply_mapped_review_edits(
 
             if column == "value":
                 if _is_missing_review_value(reviewed.at[row_index, "original_value"]):
-                    reviewed.at[row_index, "original_value"] = reviewed.at[row_index, "value"]
+                    val = reviewed.at[row_index, "value"]
+                    reviewed.at[row_index, "original_value"] = str(val) if not _is_missing_review_value(val) else ""
                 reviewed.at[row_index, "normalized_value"] = new_value
                 value_changed = True
             reviewed.at[row_index, column] = new_value
@@ -1132,8 +1134,9 @@ def restore_mapped_review_original_values(mapped_df: pd.DataFrame | None) -> pd.
     for row_index, row in reviewed.iterrows():
         original_value = row.get("original_value")
         if bool(row.get("edited_by_user")) and not _is_missing_review_value(original_value):
-            reviewed.at[row_index, "value"] = original_value
-            reviewed.at[row_index, "normalized_value"] = original_value
+            restored_val = _coerce_review_number(original_value)
+            reviewed.at[row_index, "value"] = restored_val
+            reviewed.at[row_index, "normalized_value"] = restored_val
             reviewed.at[row_index, "original_value"] = ""
             reviewed.at[row_index, "normalization_method"] = "manual_complex_mapping"
         reviewed.at[row_index, "edited_by_user"] = False
@@ -1611,7 +1614,14 @@ def format_table_summary_for_ui(table_summary_df: pd.DataFrame) -> pd.DataFrame:
     """Return table summary with concise Russian headers."""
     if table_summary_df.empty:
         return table_summary_df
-    return select_existing_columns(table_summary_df, TABLE_SUMMARY_COLUMNS).rename(columns=TABLE_SUMMARY_LABELS_RU)
+    
+    df = table_summary_df.copy()
+    # Ensure numeric columns are consistently typed
+    for col in ["page", "raw_rows_count", "column_count", "rows_count", "columns_count"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+            
+    return select_existing_columns(df, TABLE_SUMMARY_COLUMNS).rename(columns=TABLE_SUMMARY_LABELS_RU)
 
 
 def select_profile_candidate_export_columns(table_summary_df: pd.DataFrame) -> pd.DataFrame:
@@ -1641,6 +1651,12 @@ def prepare_ocr_candidates_for_ui(ocr_candidates_df: pd.DataFrame) -> pd.DataFra
         candidates["information_score"] = fallback_score
     candidates["table_score"] = pd.to_numeric(candidates["table_score"], errors="coerce").fillna(0.0)
     candidates["information_score"] = pd.to_numeric(candidates["information_score"], errors="coerce").fillna(0.0)
+    
+    # Ensure numeric columns are consistently typed to avoid Arrow serialization errors
+    for col in ["rows_count", "numbers_count", "page"]:
+        if col in candidates.columns:
+            candidates[col] = pd.to_numeric(candidates[col], errors="coerce").fillna(0).astype(int)
+
     if "ocr_block_id" not in candidates.columns:
         candidates["ocr_block_id"] = [f"ocr_candidate_{index + 1}" for index in range(len(candidates))]
     if "candidate_type" not in candidates.columns:
@@ -1865,7 +1881,7 @@ def profile_builder_reconstruction_config(
     *,
     builder_source: str | None = None,
     selected_block_uids: list[str] | None = None,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     applied_state = st.session_state.get(f"profile_builder_table_reconstruction_applied:{document_key}") or {}
     if not profile_builder_reconstruction_state_matches(
         applied_state,
@@ -1873,10 +1889,16 @@ def profile_builder_reconstruction_config(
         selected_block_uids=selected_block_uids,
     ):
         return {"method": "none"}
+    
+    method = str(applied_state.get("method") or "none").strip()
+    if method == "pair_name_row_with_following_value_row":
+        return {"method": "pair_name_row_with_following_value_row"}
+        
     pattern = str(applied_state.get("pattern") or "").strip()
-    if not pattern:
-        return {"method": "none"}
-    return {"method": "split_by_regex", "pattern": pattern}
+    if method == "split_by_regex" and pattern:
+        return {"method": "split_by_regex", "pattern": pattern}
+        
+    return {"method": "none"}
 
 
 def profile_builder_applied_reconstruction_pattern(
@@ -1968,9 +1990,20 @@ def profile_builder_catalog_for_source(
 
 
 def profile_builder_source_label(source: str) -> str:
+    engine_name = "Tesseract"
+    try:
+        # Try to find which document is active to get its engine
+        # This is a bit of a hack but works for the current Streamlit structure
+        for key in st.session_state.keys():
+            if key.startswith("profile_builder_ocr_engine:"):
+                engine_name = str(st.session_state.get(key, "Tesseract")).capitalize()
+                break
+    except Exception:
+        pass
+
     return {
         "pdf_text_layer": "Текстовый слой PDF / pdfplumber",
-        "ocr": "OCR / Tesseract",
+        "ocr": f"OCR / {engine_name}",
         "mixed": "Смешанный режим",
     }.get(source, source)
 
@@ -1980,12 +2013,14 @@ def profile_builder_extraction_config(document_key: str) -> dict[str, object]:
     ocr_lang = str(st.session_state.get(f"profile_builder_ocr_lang:{document_key}") or "rus+eng")
     ocr_pages = str(st.session_state.get(f"profile_builder_ocr_pages:{document_key}") or "auto")
     ocr_dpi = int(st.session_state.get(f"profile_builder_ocr_dpi:{document_key}") or 300)
+    ocr_engine = str(st.session_state.get(f"profile_builder_ocr_engine:{document_key}", "tesseract")).lower()
+    
     if source == "ocr":
         return {
             "source": "ocr",
             "ocr": {
                 "required": True,
-                "engine": "tesseract",
+                "engine": ocr_engine,
                 "lang": ocr_lang,
                 "pages": ocr_pages or "auto",
                 "dpi": ocr_dpi,
@@ -1995,11 +2030,11 @@ def profile_builder_extraction_config(document_key: str) -> dict[str, object]:
         return {
             "source": "mixed",
             "primary": "pdfplumber",
-            "fallback": "tesseract",
+            "fallback": ocr_engine,
             "pdf_engine": "pdfplumber",
             "ocr": {
                 "required": False,
-                "engine": "tesseract",
+                "engine": ocr_engine,
                 "lang": ocr_lang,
                 "pages": ocr_pages or "auto",
                 "dpi": ocr_dpi,
@@ -2098,10 +2133,14 @@ def build_profile_builder_column_mapping(document_key: str, max_columns: int) ->
 def profile_builder_uses_token_mapping(source_rows: list[dict]) -> bool:
     if not source_rows:
         return False
-    has_ocr = any(str(row.get("source_kind") or "") == "ocr_candidate" for row in source_rows)
+    source_kinds = {str(row.get("source_kind") or "") for row in source_rows}
+    has_ocr = "ocr_candidate" in source_kinds
     max_columns = max((len(row.get("cells") or []) for row in source_rows), default=0)
     max_tokens = max((len(row.get("numeric_tokens") or []) for row in source_rows), default=0)
-    return bool(has_ocr and max_columns <= 2 and max_tokens > 0)
+    
+    # If it's OCR and poorly structured (few columns), always allow token mapping.
+    # Also allow if it's OCR and we see some numbers.
+    return bool(has_ocr and (max_columns <= 2 or max_tokens >= 1))
 
 
 def profile_builder_max_tokens(source_rows: list[dict]) -> int:
@@ -2200,6 +2239,32 @@ def build_profile_builder_config(
     elif source == "ocr":
         block_config["source_kind"] = "ocr_candidate"
 
+    # Dynamically determine required fields based on mapped roles
+    required_fields = []
+    
+    # Check column mappings
+    for col_config in column_mapping.values():
+        role = col_config.get("role")
+        if role in {"name", "code", "custom_text"}:
+            if "name" not in required_fields:
+                required_fields.append("name")
+        elif role in {"value", "value_direct", "value_intraport", "percent", "custom_numeric"}:
+            if "value" not in required_fields:
+                required_fields.append("value")
+                
+    # Check token mappings
+    for token_config in token_mapping.values():
+        if token_config.get("enabled"):
+            # Token mapping implies value and name (from text part)
+            if "name" not in required_fields:
+                required_fields.append("name")
+            if "value" not in required_fields:
+                required_fields.append("value")
+                
+    # Default fallback if nothing was detected (prevents breaking validation logic if user mapped nothing)
+    if not required_fields:
+        required_fields = ["name", "value"]
+
     return {
         "profile_name": profile_name or "user_source_profile",
         "display_name": display_name or profile_name or "Пользовательский профиль",
@@ -2217,7 +2282,7 @@ def build_profile_builder_config(
             }
         ],
         "normalization": {"number_format": "ru", "dash_as_null": True},
-        "validation": {"required_fields": ["name", "value"], "value_positive": True},
+        "validation": {"required_fields": required_fields, "value_positive": True},
     }
 
 
@@ -2404,6 +2469,12 @@ def render_source_profile_card(
     strategy_label = EXTRACTION_STRATEGY_LABELS.get(strategy, str(strategy))
     if extraction_source:
         strategy_label = profile_builder_source_label(str(extraction_source))
+        if str(extraction_source) == "ocr" or str(extraction_source) == "mixed":
+            ocr_engine = extraction_config.get("ocr", {}).get("engine")
+            if ocr_engine:
+                strategy_label = f"OCR / {str(ocr_engine).title().replace('Ocr', 'OCR')}"
+                if str(extraction_source) == "mixed":
+                    strategy_label = f"Mixed (PDF + {strategy_label})"
     update_frequency = config.get("update_frequency") or "-"
     text_layer_info = profile_metadata.get("text_layer_quality") or {}
     bad_text_layer = bool(text_layer_info.get("bad_text_layer"))
@@ -2674,25 +2745,27 @@ def main() -> None:
         cache_status=derived_cache_status,
         rows=len(raw_rows) + len(structured_rows),
     )
+    # Engine-specific OCR result keys
+    ocr_engine_state_key = f"profile_builder_ocr_engine:{document_key}"
+    current_builder_engine = str(st.session_state.get(ocr_engine_state_key, "tesseract")).lower()
+    
+    ocr_result_key = f"ocr_result:{document_key}:{current_builder_engine}"
+    ocr_candidates_key = f"ocr_candidates:{document_key}:{current_builder_engine}"
+    
     ocr_document_matches = st.session_state.get("ocr_document_key") == document_key
     ocr_result_df = st.session_state.get(ocr_result_key)
-    if ocr_result_df is None and ocr_document_matches:
-        ocr_result_df = st.session_state.get("ocr_result_df")
     if ocr_result_df is None:
         ocr_result_df = pd.DataFrame()
 
     ocr_candidates_df = st.session_state.get(ocr_candidates_key)
-    if ocr_candidates_df is None and ocr_document_matches:
-        ocr_candidates_df = st.session_state.get("ocr_candidates_df")
     if ocr_candidates_df is None and not ocr_result_df.empty:
         ocr_candidates_start_time = time.perf_counter()
         ocr_candidates_df = extract_ocr_table_candidates(ocr_result_df)
         st.session_state[ocr_candidates_key] = ocr_candidates_df
-        st.session_state["ocr_candidates_df"] = ocr_candidates_df
         st.session_state["ocr_document_key"] = document_key
         record_performance_timing(
             performance_timings,
-            "OCR candidates",
+            f"OCR candidates ({current_builder_engine})",
             ocr_candidates_start_time,
             cache_status="miss",
             rows=len(ocr_candidates_df),
@@ -2700,26 +2773,19 @@ def main() -> None:
     elif ocr_candidates_df is not None:
         record_performance_timing(
             performance_timings,
-            "OCR candidates",
+            f"OCR candidates ({current_builder_engine})",
             time.perf_counter(),
             cache_status="hit",
             rows=len(ocr_candidates_df),
         )
     if ocr_candidates_df is None:
         ocr_candidates_df = pd.DataFrame()
-    if ocr_candidates_df.empty:
-        stored_profile_builder_ocr_candidates = st.session_state.get(profile_builder_ocr_candidates_key)
-        if isinstance(stored_profile_builder_ocr_candidates, pd.DataFrame) and not stored_profile_builder_ocr_candidates.empty:
-            ocr_candidates_df = stored_profile_builder_ocr_candidates.copy()
-            st.session_state[ocr_candidates_key] = ocr_candidates_df
-            st.session_state["ocr_candidates_df"] = ocr_candidates_df
-            st.session_state["ocr_document_key"] = document_key
-        stored_profile_builder_ocr_result = st.session_state.get(profile_builder_ocr_result_key)
-        if ocr_result_df.empty and isinstance(stored_profile_builder_ocr_result, pd.DataFrame):
-            ocr_result_df = stored_profile_builder_ocr_result.copy()
-            st.session_state[ocr_result_key] = ocr_result_df
-            st.session_state["ocr_result_df"] = ocr_result_df
-            st.session_state["ocr_document_key"] = document_key
+
+    # Synchronization with profile builder state
+    profile_builder_ocr_result_key = f"profile_builder_ocr_result:{document_key}:{current_builder_engine}"
+    profile_builder_ocr_candidates_key = f"profile_builder_ocr_candidates:{document_key}:{current_builder_engine}"
+    profile_builder_ocr_blocks_catalog_key = f"profile_builder_ocr_blocks_catalog:{document_key}:{current_builder_engine}"
+
     if not ocr_candidates_df.empty:
         st.session_state[profile_builder_ocr_candidates_key] = ocr_candidates_df.copy()
         st.session_state[profile_builder_ocr_blocks_catalog_key] = build_profile_table_catalog(
@@ -2755,6 +2821,13 @@ def main() -> None:
         profile_ocr_engine = str(ocr_config.get("engine") or "tesseract").lower()
         profile_ocr_dpi = int(ocr_config.get("dpi") or 300)
         
+        # Engine-specific keys for this run
+        run_ocr_result_key = f"ocr_result:{document_key}:{profile_ocr_engine}"
+        run_ocr_candidates_key = f"ocr_candidates:{document_key}:{profile_ocr_engine}"
+        run_pb_result_key = f"profile_builder_ocr_result:{document_key}:{profile_ocr_engine}"
+        run_pb_candidates_key = f"profile_builder_ocr_candidates:{document_key}:{profile_ocr_engine}"
+        run_pb_catalog_key = f"profile_builder_ocr_blocks_catalog:{document_key}:{profile_ocr_engine}"
+
         try:
             engine = get_ocr_engine(profile_ocr_engine)
             settings = OcrSettings(
@@ -2765,28 +2838,49 @@ def main() -> None:
             ocr_results = engine.recognize_pdf(str(saved_path), settings)
             extracted = ocr_page_results_to_dataframe(ocr_results, str(saved_path.name))
         except Exception as e:
-            st.error(f"OCR processing failed: {e}")
+            error_str = str(e)
+            if "ConvertPirAttribute2RuntimeAttribute" in error_str or "PaddleOCR worker failed" in error_str and "pir::ArrayAttribute" in error_str:
+                st.error("PaddleOCR failed due to a known PaddlePaddle CPU inference issue. Try:\n\n`python -m pip uninstall -y paddlepaddle`\n`python -m pip install paddlepaddle==3.2.2`")
+            else:
+                st.error(f"OCR processing failed ({profile_ocr_engine}): {e}")
+            # Clear stale results if OCR failed
+            st.session_state.pop(run_ocr_result_key, None)
+            st.session_state.pop(run_ocr_candidates_key, None)
             raise
-        
+
         validated = validate_extracted_data(extracted)
+
+        # Check for empty text in OCR results
+        empty_pages = []
+        if not validated.empty:
+            for _, row in validated.iterrows():
+                if not str(row.get("evidence_text") or "").strip():
+                    empty_pages.append(int(row.get("page")))
+
+        if empty_pages:
+            st.warning(f"{profile_ocr_engine.upper()} OCR вернул пустой текст для страниц: {sorted(empty_pages)}")
+
         candidates = extract_ocr_table_candidates(validated)
-        st.session_state[ocr_result_key] = validated
-        st.session_state[ocr_candidates_key] = candidates
-        st.session_state[profile_builder_ocr_result_key] = validated.copy()
-        st.session_state[profile_builder_ocr_candidates_key] = candidates.copy()
-        st.session_state[profile_builder_ocr_blocks_catalog_key] = build_profile_table_catalog(
+        
+        # Store in engine-specific keys
+        st.session_state[run_ocr_result_key] = validated
+        st.session_state[run_ocr_candidates_key] = candidates
+        st.session_state[run_pb_result_key] = validated.copy()
+        st.session_state[run_pb_candidates_key] = candidates.copy()
+        st.session_state[run_pb_catalog_key] = build_profile_table_catalog(
             pd.DataFrame(),
             None,
             candidates,
         )
-        st.session_state["ocr_result_df"] = validated
-        st.session_state["ocr_candidates_df"] = candidates
         st.session_state["ocr_document_key"] = document_key
+        
+        # Clean up wizard state
         st.session_state.pop(f"profile_builder_block_selection_applied:{document_key}", None)
         st.session_state.pop(f"profile_builder_block_selection_draft:{document_key}", None)
         st.session_state.pop(f"profile_builder_table_reconstruction_applied:{document_key}", None)
         st.session_state.pop(f"profile_builder_split_pattern_draft:{document_key}", None)
         st.session_state.pop(f"profile_builder_manual_rows:{document_key}", None)
+        
         return {"ocr_result_df": validated, "ocr_candidates_df": candidates}
 
     prototype_structured_df = st.session_state.get(prototype_structured_key)
@@ -2846,29 +2940,164 @@ def main() -> None:
     if user_profile_candidates:
         applied_user_profile_config = user_profile_candidates[0]
         user_profile_apply_start_time = time.perf_counter()
-        with st.spinner("Применяется пользовательский профиль источника..."):
-            user_profile_result = apply_user_profile(
-                {"raw_rows": raw_rows, "ocr_candidates_df": ocr_candidates_df, "file_path": str(saved_path)},
-                applied_user_profile_config,
-                ocr_runner=run_user_profile_ocr,
-            )
-        user_profile_structured_df = user_profile_result["structured_rows"]
-        if isinstance(user_profile_result.get("ocr_candidates_df"), pd.DataFrame) and not user_profile_result["ocr_candidates_df"].empty:
-            ocr_candidates_df = user_profile_result["ocr_candidates_df"]
-        st.session_state[user_profile_structured_key] = user_profile_structured_df
-        st.session_state[applied_user_profile_key] = applied_user_profile_config
+        
+        # Determine actual extraction strategy for display
+        saved_profile_source = applied_user_profile_config.get("extraction", {}).get("source", "pdf_text_layer")
+        saved_profile_ocr_engine = applied_user_profile_config.get("extraction", {}).get("ocr", {}).get("engine", "tesseract")
+        
+        display_strategy = "user-defined profile"
+        if saved_profile_source == "ocr":
+            display_strategy = f"OCR / {str(saved_profile_ocr_engine).title().replace('Ocr', 'OCR')}"
+        elif saved_profile_source == "mixed":
+            display_strategy = f"Mixed (PDF + OCR / {str(saved_profile_ocr_engine).title().replace('Ocr', 'OCR')})"
+
         if not user_profile_structured_df.empty or selected_is_user_profile:
             structured_rows = user_profile_structured_df
             active_profile = str(applied_user_profile_config.get("profile_name") or active_profile)
             is_generic_pdf = False
+            
             profile_metadata = {
                 **profile_metadata,
                 "profile_name": active_profile,
                 "profile_confidence": 1.0,
                 "profile_reason": "Применён пользовательский source profile",
                 "profile_selection": "manual" if selected_is_user_profile else "auto_user_profile",
-                "selected_extraction_strategy": "user-defined profile",
+                "selected_extraction_strategy": display_strategy,
             }
+            
+        with st.expander("Техническая отладка профиля"):
+            # Gather profile diagnostics from attributes
+            profile_diags = user_profile_structured_df.attrs.get("profile_diagnostics", {})
+            table_diag = profile_diags.get("table_0", {})
+            
+            # Gather engine diagnostics
+            ocr_result_methods = []
+            if not ocr_result_df.empty and "extraction_method" in ocr_result_df.columns:
+                ocr_result_methods = ocr_result_df["extraction_method"].unique().tolist()
+            
+            ocr_candidate_methods = []
+            if not ocr_candidates_df.empty and "extraction_method" in ocr_candidates_df.columns:
+                ocr_candidate_methods = ocr_candidates_df["extraction_method"].unique().tolist()
+
+            available_ocr_block_uids = []
+            if not ocr_candidates_df.empty and "ocr_block_id" in ocr_candidates_df.columns:
+                available_ocr_block_uids = ocr_candidates_df["ocr_block_id"].dropna().unique().tolist()
+
+            saved_blocks = applied_user_profile_config.get("blocks") or []
+            saved_profile_selected_block_uids = []
+            saved_profile_selected_row_uids = []
+            for b in saved_blocks:
+                uids = (b.get("selector") or {}).get("block_uids") or []
+                saved_profile_selected_block_uids.extend(uids)
+                row_filters = b.get("row_filters") or b.get("row_selection")
+                if isinstance(row_filters, dict):
+                    selected_rows = row_filters.get("selected_row_uids") or row_filters.get("selected_source_rows") or []
+                    saved_profile_selected_row_uids.extend(selected_rows)
+                elif isinstance(row_filters, list):
+                    for rf in row_filters:
+                        if isinstance(rf, dict) and rf.get("type") == "manual_selected_rows":
+                            selected_rows = rf.get("selected_source_rows") or rf.get("source_rows") or []
+                            saved_profile_selected_row_uids.extend(selected_rows)
+                            
+            # Compute intersection based on raw UID part
+            target_ocr_uids = []
+            for uid in saved_profile_selected_block_uids:
+                if str(uid).startswith("ocr_candidate:"):
+                    parts = str(uid).split(":", 2)
+                    if len(parts) == 3:
+                        target_ocr_uids.append(parts[2])
+                else:
+                    target_ocr_uids.append(str(uid))
+                    
+            matched_selected_block_uids = [uid for uid in available_ocr_block_uids if uid in target_ocr_uids]
+            missing_selected_block_uids = [uid for uid in target_ocr_uids if uid not in available_ocr_block_uids]
+
+            actual_ocr_engine_used = ocr_candidate_methods[0].replace("_ocr", "").replace("_candidate", "") if ocr_candidate_methods else None
+
+            debug_info = {
+                "metric": [
+                    "selected_profile_name",
+                    "saved_profile_source",
+                    "saved_profile_ocr_engine",
+                    "actual_ocr_engine_used",
+                    "reconstruction_mode",
+                    "ocr_result_rows",
+                    "ocr_candidates_rows",
+                    "source_block_rows_count",
+                    "reconstructed_rows_count",
+                    "rows_after_manual_selection",
+                    "structured_rows_after_profile"
+                ],
+                "value": [
+                    str(active_profile),
+                    str(saved_profile_source),
+                    str(saved_profile_ocr_engine),
+                    str(actual_ocr_engine_used),
+                    str(table_diag.get("reconstruction_mode", "none")),
+                    str(len(ocr_result_df)),
+                    str(len(ocr_candidates_df)),
+                    str(table_diag.get("source_block_rows_count", 0)),
+                    str(table_diag.get("reconstructed_rows_count", 0)),
+                    str(table_diag.get("rows_after_manual_selection", 0)),
+                    str(len(user_profile_structured_df))
+                ]
+            }
+            
+            st.dataframe(pd.DataFrame(debug_info), use_container_width=True)
+            
+            zero_rows_reason = ""
+            if len(user_profile_structured_df) == 0:
+                if not matched_selected_block_uids and saved_profile_source == "ocr":
+                    zero_rows_reason = "Не найдено пересечений между сохранёнными block_uids профиля и сгенерированными OCR-кандидатами."
+                elif table_diag.get("reconstructed_rows_count", 0) > 0 and table_diag.get("rows_after_manual_selection", 0) == 0:
+                    zero_rows_reason = "Все реконструированные строки были отфильтрованы. Проверьте selected_row_uids в профиле."
+                else:
+                    # Check validation mappings against required fields
+                    required_fields = applied_user_profile_config.get("validation", {}).get("required_fields", [])
+                    produced_fields = []
+                    for b in saved_blocks:
+                        for col_map in b.get("column_mapping", {}).values():
+                            role = col_map.get("role")
+                            if role in {"name", "code", "custom_text"} and "name" not in produced_fields:
+                                produced_fields.append("name")
+                            if role in {"value", "value_direct", "value_intraport", "percent", "custom_numeric"} and "value" not in produced_fields:
+                                produced_fields.append("value")
+                        for t_map in b.get("token_mapping", {}).values():
+                            if t_map.get("enabled"):
+                                if "name" not in produced_fields: produced_fields.append("name")
+                                if "value" not in produced_fields: produced_fields.append("value")
+                                
+                    missing_req_fields = [f for f in required_fields if f not in produced_fields]
+                    if missing_req_fields:
+                        zero_rows_reason = f"Validation removed rows because required fields are missing: {', '.join(missing_req_fields)}"
+                    else:
+                        zero_rows_reason = "Все строки были отфильтрованы row_filters или token_mapping."
+                        
+                st.warning(zero_rows_reason)
+            
+            st.json({
+                "saved_profile_selected_block_uids": saved_profile_selected_block_uids,
+                "saved_profile_selected_row_uids": saved_profile_selected_row_uids,
+                "support_rows_included": table_diag.get("support_rows_included", []),
+                "available_ocr_block_uids": available_ocr_block_uids,
+                "matched_selected_block_uids": matched_selected_block_uids,
+                "missing_selected_block_uids": missing_selected_block_uids,
+                "ocr_ran": user_profile_result.get("ocr_ran", False),
+                "status": user_profile_result.get("status"),
+                "ocr_engine_diagnostics": {
+                    "ocr_result_extraction_methods": ocr_result_methods,
+                    "ocr_candidate_extraction_methods": ocr_candidate_methods,
+                }
+            })
+            if not user_profile_structured_df.empty:
+                st.write("Примеры итоговых строк:")
+                st.dataframe(user_profile_structured_df.head(3), use_container_width=True)
+            else:
+                st.warning("Профиль не произвёл ни одной строки. Проверьте селекторы блоков и фильтры строк.")
+                if applied_user_profile_config:
+                    st.write("Конфигурация таблиц в профиле:")
+                    st.json(applied_user_profile_config.get("blocks") or applied_user_profile_config.get("tables"))
+
         record_performance_timing(
             performance_timings,
             "user profile parser",
@@ -3091,6 +3320,17 @@ def main() -> None:
                     with st.spinner("OCR-извлечение выбранных страниц..."):
                         extracted_ocr_df = extract_ocr_pages(str(saved_path), selected_ocr_pages, lang=ocr_lang)
                         ocr_result_df = validate_extracted_data(extracted_ocr_df)
+                        
+                        # Check for empty text in OCR results
+                        empty_pages = []
+                        if not ocr_result_df.empty:
+                            for _, row in ocr_result_df.iterrows():
+                                if not str(row.get("evidence_text") or "").strip():
+                                    empty_pages.append(int(row.get("page")))
+                        
+                        if empty_pages:
+                            st.warning(f"OCR вернул пустой текст для страниц: {sorted(empty_pages)}")
+                        
                         ocr_candidates_df = extract_ocr_table_candidates(ocr_result_df)
                         st.session_state[ocr_result_key] = ocr_result_df
                         st.session_state[ocr_candidates_key] = ocr_candidates_df
@@ -4179,6 +4419,8 @@ def main() -> None:
                         "wizard_step": wizard_step,
                         "builder_source": builder_source,
                         "default_builder_source": default_builder_source,
+                        "selected_ocr_engine_from_ui": current_builder_engine,
+                        "durable_ocr_engine_state": st.session_state.get(ocr_engine_state_key),
                         "source_state_key": source_state_key,
                         "source_state_value": st.session_state.get(source_state_key),
                         "source_widget_key": source_widget_key,
@@ -4210,7 +4452,24 @@ def main() -> None:
                         candidate_pages = sorted(ocr_candidates_df["page"].unique().tolist()) if not ocr_candidates_df.empty else []
                         catalog_pages = sorted(table_catalog_df["page"].unique().tolist()) if not table_catalog_df.empty else []
                         missing_pages = [p for p in ocr_pages if p not in candidate_pages]
-                        
+
+                        # Enhanced per-page debug info
+                        raw_page_stats = []
+                        for page_num in ocr_pages:
+                            page_rows = ocr_result_df[ocr_result_df["page"] == page_num]
+                            if not page_rows.empty:
+                                first_row = page_rows.iloc[0]
+                                evidence_text = str(first_row.get("evidence_text") or "")
+                                raw_page_stats.append({
+                                    "page": int(page_num),
+                                    "text_len": len(evidence_text),
+                                    "lines_count": len(evidence_text.splitlines()),
+                                    "numbers_count": len(re.findall(r"\d+", evidence_text)),
+                                    "extraction_method": first_row.get("extraction_method"),
+                                    "ocr_engine": first_row.get("ocr_engine"),
+                                    "has_candidate": page_num in candidate_pages
+                                })
+
                         debug_payload["ocr_multipage_stats"] = {
                             "ocr_result_pages": ocr_pages,
                             "candidate_pages": candidate_pages,
@@ -4219,7 +4478,23 @@ def main() -> None:
                             "total_ocr_pages": len(ocr_pages),
                             "total_candidate_pages": len(candidate_pages),
                             "total_catalog_pages": len(catalog_pages),
+                            "raw_page_stats": raw_page_stats,
                         }
+
+                        if missing_pages:
+                            debug_payload["candidate_skip_reasons"] = {}
+                            from src.ocr_table_candidates import _has_fallback_criteria
+                            for mp in missing_pages:
+                                page_text = str(ocr_result_df[ocr_result_df["page"] == mp]["evidence_text"].iloc[0] or "")
+                                if not page_text.strip():
+                                    reason = "Пустой текст OCR"
+                                elif len(page_text.splitlines()) < 5:
+                                    reason = f"Слишком мало строк ({len(page_text.splitlines())} < 5)"
+                                elif not _has_fallback_criteria(page_text):
+                                    reason = "Не соответствует критериям fallback (мало чисел или ключевых слов)"
+                                else:
+                                    reason = "Неизвестная причина (критерии fallback пройдены, но кандидат не создан)"
+                                debug_payload["candidate_skip_reasons"][f"стр. {mp}"] = reason
                     
                     with st.expander("Debug OCR wizard state", expanded=True):
                         st.json(debug_payload)
@@ -4252,37 +4527,47 @@ def main() -> None:
                         st.rerun()
                     if selected_source in {"ocr", "mixed"}:
                         available_engines_dict = get_available_engines()
-                        available_engine_names = [name for name, (display_name, (is_available, _)) in available_engines_dict.items() if is_available]
-                        available_engine_displays = [available_engines_dict[name][0] for name in available_engine_names]
+                        all_engine_names = ["tesseract", "paddleocr", "yandex_vision"]
                         
-                        if not available_engine_names:
-                            st.error("No OCR engines available. Please install Tesseract or PaddleOCR, or configure Yandex Vision credentials.")
-                        else:
-                            ocr_cols = st.columns(3)
+                        ocr_cols = st.columns(3)
+                        
+                        engine_state_key = f"profile_builder_ocr_engine:{document_key}"
+                        
+                        if engine_state_key not in st.session_state:
+                            st.session_state[engine_state_key] = "tesseract"
                             
-                            current_engine = st.session_state.get(f"profile_builder_ocr_engine:{document_key}", "tesseract")
-                            if current_engine not in available_engine_names:
-                                current_engine = available_engine_names[0]
-                                st.session_state[f"profile_builder_ocr_engine:{document_key}"] = current_engine
-                            
-                            selected_engine_display = ocr_cols[0].selectbox(
-                                "OCR engine",
-                                options=available_engine_names,
-                                format_func=lambda name: available_engines_dict[name][0],
-                                index=available_engine_names.index(current_engine) if current_engine in available_engine_names else 0,
-                                key=f"profile_builder_ocr_engine:{document_key}",
-                            )
-                            
-                            ocr_cols[1].text_input(
-                                "Язык OCR",
-                                value=st.session_state.get(f"profile_builder_ocr_lang:{document_key}", "rus+eng"),
-                                key=f"profile_builder_ocr_lang:{document_key}",
-                            )
-                            ocr_cols[2].text_input(
-                                "Страницы для OCR",
-                                value=st.session_state.get(f"profile_builder_ocr_pages:{document_key}", "auto"),
-                                help="auto или список страниц через запятую, например 1,2,3",
-                                key=f"profile_builder_ocr_pages:{document_key}",
+                        current_engine = st.session_state.get(engine_state_key, "tesseract")
+                        if current_engine not in all_engine_names:
+                            current_engine = "tesseract"
+                        
+                        engine_widget_key = f"profile_builder_ocr_engine_widget:{document_key}"
+                        selected_engine = ocr_cols[0].selectbox(
+                            "OCR engine",
+                            options=all_engine_names,
+                            format_func=lambda name: available_engines_dict.get(name, (name, (False, "")))[0],
+                            index=all_engine_names.index(current_engine) if current_engine in all_engine_names else 0,
+                            key=engine_widget_key,
+                        )
+                        
+                        if selected_engine != current_engine:
+                            st.session_state[engine_state_key] = selected_engine
+                            st.rerun()
+                        
+                        # Show availability message if the selected engine is not available
+                        is_available, availability_msg = available_engines_dict.get(selected_engine, (selected_engine, (False, "Unknown engine")))[1]
+                        if not is_available:
+                            st.warning(availability_msg)
+                        
+                        ocr_cols[1].text_input(
+                            "Язык OCR",
+                            value=st.session_state.get(f"profile_builder_ocr_lang:{document_key}", "rus+eng"),
+                            key=f"profile_builder_ocr_lang:{document_key}",
+                        )
+                        ocr_cols[2].text_input(
+                            "Страницы для OCR",
+                            value=st.session_state.get(f"profile_builder_ocr_pages:{document_key}", "auto"),
+                            help="auto или список страниц через запятую, например 1,2,3",
+                            key=f"profile_builder_ocr_pages:{document_key}",
                         )
                         st.number_input(
                             "DPI",
@@ -4292,8 +4577,8 @@ def main() -> None:
                             step=50,
                             key=f"profile_builder_ocr_dpi:{document_key}",
                         )
-                        if st.button("Запустить OCR", key=f"profile_builder_run_ocr:{document_key}"):
-                            with st.spinner("OCR / Tesseract выполняется по настройкам профиля..."):
+                        if st.button("Запустить OCR", key=f"profile_builder_run_ocr:{document_key}", disabled=not is_available):
+                            with st.spinner(f"OCR / {selected_engine} выполняется по настройкам профиля..."):
                                 run_user_profile_ocr({}, profile_builder_extraction_config(document_key).get("ocr") or {})
                             st.success("OCR завершён. Перейдите к выбору OCR-кандидатов.")
                             st.rerun()
@@ -4341,9 +4626,9 @@ def main() -> None:
                         st.info("Для выбранного источника пока нет таблиц или OCR-кандидатов.")
                 else:
                     table_options = profile_builder_table_options(table_catalog_df)
-                    selected_tables_state_key = f"profile_builder_block_selection_applied:{document_key}"
-                    draft_tables_state_key = f"profile_builder_block_selection_draft:{document_key}"
-                    selected_rows_state_key = f"profile_builder_manual_rows:{document_key}"
+                    selected_tables_state_key = f"profile_builder_block_selection_applied:{document_key}:{current_builder_engine}"
+                    draft_tables_state_key = f"profile_builder_block_selection_draft:{document_key}:{current_builder_engine}"
+                    selected_rows_state_key = f"profile_builder_manual_rows:{document_key}:{current_builder_engine}"
                     if selected_tables_state_key not in st.session_state:
                         st.session_state[selected_tables_state_key] = table_options[:1]
                     if draft_tables_state_key not in st.session_state:
@@ -4402,15 +4687,24 @@ def main() -> None:
                             table_catalog_df,
                             st.session_state.get(draft_tables_state_key, selected_builder_table_keys),
                         )
+                        
+                        # Fix Arrow serialization: ensure strict string/numeric typing
+                        for col in ["block_uid", "table_key", "source_kind", "block_title", "Таблица", "Краткий preview", "extraction_method"]:
+                            if col in table_editor_df.columns:
+                                table_editor_df[col] = table_editor_df[col].fillna("").astype(str)
+                        for col in ["Страница", "Найдено строк", "Найдено колонок"]:
+                            if col in table_editor_df.columns:
+                                table_editor_df[col] = pd.to_numeric(table_editor_df[col], errors="coerce").fillna(0).astype(int)
+
                         block_action_cols = st.columns(3)
-                        if block_action_cols[0].button("Выбрать все блоки", key=f"profile_builder_blocks_all:{document_key}"):
+                        if block_action_cols[0].button("Выбрать все блоки", key=f"profile_builder_blocks_all:{document_key}:{current_builder_engine}"):
                             st.session_state[draft_tables_state_key] = table_options
                             st.rerun()
-                        if block_action_cols[1].button("Снять выбор", key=f"profile_builder_blocks_clear:{document_key}"):
+                        if block_action_cols[1].button("Снять выбор", key=f"profile_builder_blocks_clear:{document_key}:{current_builder_engine}"):
                             st.session_state[draft_tables_state_key] = []
                             st.rerun()
 
-                        with st.form(f"profile_builder_block_selection_form:{document_key}"):
+                        with st.form(f"profile_builder_block_selection_form:{document_key}:{current_builder_engine}"):
                             edited_tables_df = st.data_editor(
                                 table_editor_df,
                                 use_container_width=True,
@@ -4433,23 +4727,31 @@ def main() -> None:
                                         "Использовать эту таблицу"
                                     ),
                                     "block_uid": st.column_config.TextColumn("block_uid", help="Стабильный ID выбранного блока."),
-                                    "table_key": st.column_config.TextColumn("block_uid", help="Стабильный ID выбранного блока."),
                                     "source_kind": st.column_config.TextColumn("source_kind"),
                                     "block_title": st.column_config.TextColumn("block_title", width="medium"),
                                     "Краткий preview": st.column_config.TextColumn("Краткий preview", width="large"),
                                 },
-                                key=f"profile_builder_table_editor:{document_key}",
+                                key=f"profile_builder_table_editor:{document_key}:{current_builder_engine}",
                             )
                             apply_block_selection = st.form_submit_button("Применить выбор блоков")
-                        updated_table_keys = profile_builder_selected_block_uids_from_editor(
-                            edited_tables_df,
-                            table_catalog_df,
-                        )
-                        updated_missing_block_uids = [
-                            table_key for table_key in updated_table_keys if table_key not in set(table_options)
-                        ]
-                        st.session_state[draft_tables_state_key] = updated_table_keys
+                        
                         if apply_block_selection:
+                            # Direct reading from editor instead of relying purely on helper
+                            updated_table_keys = []
+                            if PROFILE_BUILDER_USE_BLOCK_COLUMN in edited_tables_df.columns:
+                                checked_mask = edited_tables_df[PROFILE_BUILDER_USE_BLOCK_COLUMN].fillna(False).astype(bool)
+                                checked_rows = edited_tables_df.loc[checked_mask]
+                                for _, row in checked_rows.iterrows():
+                                    if "block_uid" in row and row["block_uid"]:
+                                        updated_table_keys.append(str(row["block_uid"]))
+                                    elif "table_key" in row and row["table_key"]:
+                                        updated_table_keys.append(str(row["table_key"]))
+
+                            updated_missing_block_uids = [
+                                table_key for table_key in updated_table_keys if table_key not in set(table_options)
+                            ]
+                            st.session_state[draft_tables_state_key] = updated_table_keys
+                            st.session_state[selected_tables_state_key] = updated_table_keys
                             st.session_state[f"profile_builder_last_block_selection_debug:{document_key}"] = {
                                 "submitted": True,
                                 "updated_block_uids": updated_table_keys,
@@ -4465,9 +4767,11 @@ def main() -> None:
                             if updated_table_keys != selected_builder_table_keys:
                                 st.session_state.pop(f"profile_builder_table_reconstruction_applied:{document_key}", None)
                                 st.session_state.pop(f"profile_builder_split_pattern_draft:{document_key}", None)
-                            st.session_state[selected_tables_state_key] = updated_table_keys
                             st.session_state.pop(selected_rows_state_key, None)
                             st.rerun()
+                            
+                        if missing_selected_block_uids:
+                            st.warning(f"Внимание: Выбранные блоки ({', '.join(missing_selected_block_uids)}) отсутствуют в каталоге текущего OCR engine.")
                         block_metric_cols = st.columns(2)
                         block_metric_cols[0].metric("Всего блоков", len(table_options))
                         block_metric_cols[1].metric("Выбрано блоков", len(selected_builder_table_keys))
@@ -4483,14 +4787,15 @@ def main() -> None:
                             )
 
                         with st.expander("Проблемы со структурой таблицы"):
-                            applied_separator = profile_builder_applied_reconstruction_pattern(
-                                document_key,
-                                builder_source=builder_source,
-                                selected_block_uids=selected_builder_table_keys,
+                            applied_config = (
+                                st.session_state.get(f"profile_builder_table_reconstruction_applied:{document_key}") or {}
                             )
+                            applied_method = str(applied_config.get("method") or "none")
+                            applied_pattern = str(applied_config.get("pattern") or "")
+
                             st.caption(
-                                "Текущий применённый разделитель: "
-                                + (f"`{applied_separator}`" if applied_separator else "не задан")
+                                f"Текущий метод: `{applied_method}`"
+                                + (f" (pattern: `{applied_pattern}`)" if applied_pattern else "")
                             )
                             raw_evidence_df = pd.DataFrame(
                                 [
@@ -4506,27 +4811,47 @@ def main() -> None:
                                 st.info("Сначала выберите таблицу.")
                             else:
                                 st.dataframe(raw_evidence_df, use_container_width=True, hide_index=True)
-                            draft_separator_key = f"profile_builder_split_pattern_draft:{document_key}"
-                            if draft_separator_key not in st.session_state:
-                                st.session_state[draft_separator_key] = applied_separator
-                            st.text_input(
-                                "Разделитель",
-                                placeholder=r"\s{1,}|\|",
-                                help="Если колонки склеились, задайте regex для разделения строки evidence_text.",
-                                key=draft_separator_key,
+
+                            st.divider()
+                            st.write("Настройка реконструкции:")
+
+                            recon_method = st.radio(
+                                "Метод реконструкции",
+                                options=["none", "split_by_regex", "pair_name_row_with_following_value_row"],
+                                format_func=lambda x: {
+                                    "none": "Без изменений",
+                                    "split_by_regex": "Разделить по регулярному выражению (если колонки склеились)",
+                                    "pair_name_row_with_following_value_row": "Склеивать строку с названием со следующей строкой-значением (для тарифов)",
+                                }.get(x, x),
+                                index=(
+                                    ["none", "split_by_regex", "pair_name_row_with_following_value_row"].index(
+                                        applied_method
+                                    )
+                                    if applied_method in ["none", "split_by_regex", "pair_name_row_with_following_value_row"]
+                                    else 0
+                                ),
+                                key=f"profile_builder_recon_method_radio:{document_key}",
                             )
-                            if st.button("Применить разделитель", key=f"profile_builder_apply_separator:{document_key}"):
-                                draft_separator = str(st.session_state.get(draft_separator_key) or "").strip()
-                                reconstruction_config = (
-                                    {"method": "split_by_regex", "pattern": draft_separator}
-                                    if draft_separator
-                                    else {"method": "none"}
+
+                            draft_pattern = ""
+                            if recon_method == "split_by_regex":
+                                draft_pattern = st.text_input(
+                                    "Регулярное выражение для разделения колонок",
+                                    value=applied_pattern if applied_method == "split_by_regex" else r"\s{1,}|\|",
+                                    key=f"profile_builder_split_pattern_input:{document_key}",
                                 )
-                                corrected_rows = apply_table_reconstruction(selected_source_rows_raw, reconstruction_config)
+
+                            if st.button("Применить реконструкцию", key=f"profile_builder_apply_recon:{document_key}"):
+                                recon_config = {"method": recon_method}
+                                if recon_method == "split_by_regex":
+                                    recon_config["pattern"] = draft_pattern
+
+                                corrected_rows = apply_table_reconstruction(selected_source_rows_raw, recon_config)
                                 st.session_state[f"profile_builder_table_reconstruction_applied:{document_key}"] = {
                                     "source": builder_source,
                                     "block_uids": list(selected_builder_table_keys),
-                                    "pattern": draft_separator,
+                                    "method": recon_method,
+                                    "pattern": draft_pattern,
                                     "rows": corrected_rows,
                                 }
                                 st.session_state.pop(selected_rows_state_key, None)
@@ -4787,6 +5112,74 @@ def main() -> None:
                             table_config.get("column_mapping"),
                         )
                         metrics = profile_builder_preview_metrics(builder_preview_df, len(filtered_source_rows))
+                        
+                        with st.expander("Отладка извлечения (Preview)"):
+                            # Gather engine diagnostics
+                            ocr_result_methods = []
+                            if not ocr_result_df.empty and "extraction_method" in ocr_result_df.columns:
+                                ocr_result_methods = ocr_result_df["extraction_method"].unique().tolist()
+
+                            ocr_candidate_methods = []
+                            if not ocr_candidates_df.empty and "extraction_method" in ocr_candidates_df.columns:
+                                ocr_candidate_methods = ocr_candidates_df["extraction_method"].unique().tolist()
+
+                            # Reconstruction diagnostics
+                            recon_config = table_config.get("table_reconstruction") or {}
+                            recon_mode = recon_config.get("method", "none")
+                            paired_rows_count = sum(1 for r in filtered_source_rows if r.get("table_reconstruction_method") == "pair_name_row_with_following_value_row")
+
+                            recon_metrics = {
+                                "metric": [
+                                    "reconstruction_mode",
+                                    "source_rows_before_reconstruction",
+                                    "output_rows_after_reconstruction",
+                                    "paired_rows_count",
+                                    "has_token_mapping",
+                                    "has_column_mapping",
+                                    "token_mapping_mode",
+                                    "ocr_result_rows",
+                                    "ocr_candidate_rows"
+                                ],
+                                "value": [
+                                    str(recon_mode),
+                                    str(len(selected_source_rows)),
+                                    str(len(filtered_source_rows)),
+                                    str(paired_rows_count),
+                                    str(bool(table_config.get("token_mapping"))),
+                                    str(bool(table_config.get("column_mapping"))),
+                                    str(token_mapping_mode),
+                                    str(len(ocr_result_df)),
+                                    str(len(ocr_candidates_df))
+                                ]
+                            }
+                            st.dataframe(pd.DataFrame(recon_metrics), use_container_width=True)
+
+                            debug_info = {
+                                "selected_block_uids": selected_builder_table_keys,
+                                "selected_row_uids": selected_row_keys,
+                                "num_source_rows_total": len(selected_source_rows),
+                                "num_filtered_rows": len(filtered_source_rows),
+                                "num_output_rows": len(builder_preview_df),
+                                "builder_source": builder_source,
+                                "table_config": table_config,
+                                "ocr_engine_diagnostics": {
+                                    "selected_ocr_engine_from_ui": current_builder_engine,
+                                    "ocr_result_rows": len(ocr_result_df),
+                                    "ocr_candidate_rows": len(ocr_candidates_df),
+                                    "ocr_result_extraction_methods": ocr_result_methods,
+                                    "ocr_candidate_extraction_methods": ocr_candidate_methods,
+                                }
+                            }
+                            st.json(debug_info)
+                            if selected_source_rows:
+                                st.write("Примеры source_row_uids в таблице:")
+                                st.write([profile_builder_source_row_key(r) for r in selected_source_rows[:5]])
+                            if selected_row_keys:
+                                st.write("Пересечение выбранных ключей с текущими:")
+                                current_keys = {profile_builder_source_row_key(r) for r in selected_source_rows}
+                                intersection = [k for k in selected_row_keys if k in current_keys]
+                                st.write(f"Найдено {len(intersection)} из {len(selected_row_keys)} выбранных строк.")
+
                         metric_cols = st.columns(5)
                         metric_cols[0].metric("Строк выбрано", metrics["selected_rows"])
                         metric_cols[1].metric("Итоговых строк получится", metrics["output_rows"])

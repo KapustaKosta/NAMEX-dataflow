@@ -14,23 +14,27 @@ if TYPE_CHECKING:
     import requests
 
 
-def _get_yandex_credentials() -> tuple[str, str]:
+def _get_yandex_credentials() -> dict[str, str]:
     """Get Yandex Vision API credentials from environment or Streamlit secrets."""
-    import os
+    creds = {
+        "iam_token": os.getenv("YANDEX_IAM_TOKEN"),
+        "folder_id": os.getenv("YANDEX_FOLDER_ID"),
+        "api_key": os.getenv("YANDEX_API_KEY"),
+    }
 
-    iam_token = os.getenv("YANDEX_IAM_TOKEN")
-    folder_id = os.getenv("YANDEX_FOLDER_ID")
+    try:
+        import streamlit as st
 
-    if not iam_token or not folder_id:
-        try:
-            import streamlit as st
+        if not creds["iam_token"]:
+            creds["iam_token"] = st.secrets.get("YANDEX_IAM_TOKEN")
+        if not creds["folder_id"]:
+            creds["folder_id"] = st.secrets.get("YANDEX_FOLDER_ID")
+        if not creds["api_key"]:
+            creds["api_key"] = st.secrets.get("YANDEX_API_KEY")
+    except (ImportError, AttributeError, KeyError):
+        pass
 
-            iam_token = st.secrets.get("YANDEX_IAM_TOKEN")
-            folder_id = st.secrets.get("YANDEX_FOLDER_ID")
-        except (ImportError, AttributeError, KeyError):
-            pass
-
-    return iam_token or "", folder_id or ""
+    return {k: v for k, v in creds.items() if v}
 
 
 class YandexVisionEngine(OcrEngine):
@@ -40,20 +44,24 @@ class YandexVisionEngine(OcrEngine):
     endpoint = "https://ocr.api.cloud.yandex.net/ocr/v1/recognizeText"
 
     def check_availability(self) -> tuple[bool, str]:
-        """Check if Yandex Vision is configured."""
-        iam_token, folder_id = _get_yandex_credentials()
+        """Check if Yandex Vision is configured and dependencies are met."""
+        import importlib.util
+        if importlib.util.find_spec("requests") is None:
+            return False, "Library 'requests' not installed: pip install requests"
 
-        if not iam_token:
-            return (
-                False,
-                "YANDEX_IAM_TOKEN not set. Set via env var or Streamlit secrets.",
-            )
-        if not folder_id:
-            return (
-                False,
-                "YANDEX_FOLDER_ID not set. Set via env var or Streamlit secrets.",
-            )
-        return True, "Yandex Vision API credentials configured"
+        creds = _get_yandex_credentials()
+
+        if creds.get("api_key"):
+            return True, "Yandex Vision API key configured"
+
+        if creds.get("iam_token") and creds.get("folder_id"):
+            return True, "Yandex Vision IAM token and folder ID configured"
+
+        return (
+            False,
+            "Yandex Vision credentials missing. Provide either YANDEX_API_KEY "
+            "or both YANDEX_IAM_TOKEN and YANDEX_FOLDER_ID.",
+        )
 
     def recognize_pdf(
         self,
@@ -93,7 +101,10 @@ class YandexVisionEngine(OcrEngine):
                 "fitz (PyMuPDF) required for PDF processing: pip install pymupdf"
             )
 
-        iam_token, folder_id = _get_yandex_credentials()
+        creds = _get_yandex_credentials()
+        api_key = creds.get("api_key")
+        iam_token = creds.get("iam_token")
+        folder_id = creds.get("folder_id")
 
         results: list[OcrPageResult] = []
 
@@ -123,11 +134,12 @@ class YandexVisionEngine(OcrEngine):
                         "content": image_base64,
                     }
 
-                    headers = {
-                        "Authorization": f"Bearer {iam_token}",
-                        "x-folder-id": folder_id,
-                        "Content-Type": "application/json",
-                    }
+                    headers = {"Content-Type": "application/json"}
+                    if api_key:
+                        headers["Authorization"] = f"Api-Key {api_key}"
+                    else:
+                        headers["Authorization"] = f"Bearer {iam_token}"
+                        headers["x-folder-id"] = folder_id
 
                     try:
                         response = requests.post(
@@ -142,20 +154,49 @@ class YandexVisionEngine(OcrEngine):
 
                     api_result = response.json()
 
-                    text_lines = []
-                    if "textAnnotation" in api_result:
-                        for block in api_result["textAnnotation"].get("blocks", []):
+                    # Support both nested {"result": {"textAnnotation": ...}} and flat {"textAnnotation": ...}
+                    result_data = api_result.get("result", api_result)
+                    text_annotation = result_data.get("textAnnotation", {})
+                    
+                    full_text = text_annotation.get("fullText", "")
+                    
+                    if not full_text:
+                        full_text_lines = []
+                        for block in text_annotation.get("blocks", []):
                             for line in block.get("lines", []):
-                                for word in line.get("words", []):
-                                    text = word.get("text", "")
-                                    confidence = word.get("confidence", 0.0)
-                                    if text:
-                                        text_lines.append((text, confidence))
+                                line_text = line.get("text", "")
+                                if line_text:
+                                    full_text_lines.append(line_text)
+                                else:
+                                    line_words = []
+                                    for word in line.get("words", []):
+                                        text = word.get("text", "")
+                                        if text:
+                                            line_words.append(text)
+                                    if line_words:
+                                        full_text_lines.append(" ".join(line_words))
+                        full_text = "\n".join(full_text_lines)
 
-                    full_text = " ".join([text for text, _ in text_lines])
-                    if not full_text and "fullText" in api_result:
-                        full_text = api_result["fullText"]
+                    if not full_text.strip():
+                        debug_info = {
+                            "status": response.status_code,
+                            "top_level_keys": list(api_result.keys()),
+                            "has_textAnnotation": "textAnnotation" in result_data,
+                            "has_fullText": "fullText" in text_annotation,
+                            "blocks_count": len(text_annotation.get("blocks", [])),
+                        }
+                        raise RuntimeError(f"Yandex Vision returned no text. Response shape: {debug_info}")
 
+                    # Extract confidence
+                    text_lines = []
+                    for block in text_annotation.get("blocks", []):
+                        for line in block.get("lines", []):
+                            for word in line.get("words", []):
+                                text = word.get("text", "")
+                                confidence = word.get("confidence", 0.0)
+                                if text:
+                                    text_lines.append((text, confidence))
+                                    
                     avg_confidence = (
                         sum(conf for _, conf in text_lines) / len(text_lines)
                         if text_lines

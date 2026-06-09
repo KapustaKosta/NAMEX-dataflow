@@ -54,7 +54,16 @@ new hardcoded Python parser.
 ## OCR and LLM Extension
 
 Add OCR in `src/extract_ocr.py` for scanned PDFs that do not contain embedded
-text. Add LLM extraction in `src/extract_llm.py` only for cases where rules,
+text. Supported local engines include Tesseract and PaddleOCR. Cloud engines
+like Yandex Vision are also supported. Add LLM extraction in `src/extract_llm.py` only for cases where rules,
 tables, and simple parsers cannot reliably extract structured fields. Both
 modules should keep returning the standard DataFrame schema with evidence for
 auditability.
+
+### PaddleOCR Dependencies (Windows CPU)
+When using PaddleOCR on Windows CPU, do not silently install the latest `paddlepaddle` version.
+Use the pinned stable version to avoid the `ConvertPirAttribute2RuntimeAttribute` / oneDNN / PIR runtime crash:
+
+```bash
+python -m pip install paddlepaddle==3.2.2 paddleocr
+```

@@ -185,6 +185,7 @@ def _base_ocr_record(source_file: str, page: int, row_id: int) -> dict[str, obje
     record["row_id"] = row_id
     record["section_name"] = "ocr_page_text"
     record["bbox"] = None
+    record["ocr_engine"] = "tesseract"
     record["extraction_method"] = "tesseract_ocr"
     record["extraction_level"] = "raw_ocr"
     record["text_layer_quality"] = "ocr"
@@ -192,7 +193,7 @@ def _base_ocr_record(source_file: str, page: int, row_id: int) -> dict[str, obje
     return record
 
 
-def extract_ocr_pages(file_path: str, pages: list[int], lang: str = "rus+eng") -> pd.DataFrame:
+def extract_ocr_pages(file_path: str, pages: list[int], lang: str = "rus+eng", dpi: int = 300) -> pd.DataFrame:
     """Run OCR for selected 1-based PDF pages and return raw OCR text rows."""
     page_numbers = _validate_pages(pages)
     if not page_numbers:
@@ -216,6 +217,10 @@ def extract_ocr_pages(file_path: str, pages: list[int], lang: str = "rus+eng") -
     source_file = Path(file_path).name
     records = []
 
+    # Standard PDF resolution is 72 DPI
+    zoom = dpi / 72
+    matrix = fitz.Matrix(zoom, zoom)
+
     with fitz.open(file_path) as pdf:
         page_count = len(pdf)
         for row_id, page_number in enumerate(page_numbers, start=1):
@@ -224,7 +229,7 @@ def extract_ocr_pages(file_path: str, pages: list[int], lang: str = "rus+eng") -
 
             try:
                 page = pdf.load_page(page_number - 1)
-                pixmap = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+                pixmap = page.get_pixmap(matrix=matrix, alpha=False)
                 image = Image.open(BytesIO(pixmap.tobytes("png")))
             except Exception as exc:
                 raise OCRPageRenderError(f"Ошибка рендера страницы PDF: {exc}") from exc

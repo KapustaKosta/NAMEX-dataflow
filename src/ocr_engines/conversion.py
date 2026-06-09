@@ -35,6 +35,7 @@ def ocr_page_results_to_dataframe(
             "page": result.page,
             "row_id": idx + 1,
             "evidence_text": result.text,
+            "ocr_engine": result.engine,
             "extraction_method": f"{result.engine}_ocr",
             "extraction_level": "raw_ocr",
             "section_name": f"ocr_page_text",

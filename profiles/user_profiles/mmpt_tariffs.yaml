@@ -1,4 +1,4 @@
-profile_name: mmtp_tariffs
+profile_name: mmpt_tariffs
 display_name: Тарифы ММТП
 document_match:
   keywords: []
@@ -6,7 +6,7 @@ extraction:
   source: ocr
   ocr:
     required: true
-    engine: tesseract
+    engine: yandex_vision
     lang: rus+eng
     pages: auto
     dpi: 300
@@ -14,13 +14,14 @@ blocks:
 - selector: &id002
     block_uids:
     - ocr_candidate:2:ocr_p2_fallback
-    - ocr_candidate:3:ocr_p3_fallback
   row_selection: &id003
     use_manual_rows: true
     selected_source_rows: &id001
-    - ocr_candidate:2:ocr_p2_fallback:row:15
-    - ocr_candidate:2:ocr_p2_fallback:row:17
-    - ocr_candidate:2:ocr_p2_fallback:row:18
+    - ocr_candidate:2:ocr_p2_fallback:row:30
+    - ocr_candidate:2:ocr_p2_fallback:row:32
+    - ocr_candidate:2:ocr_p2_fallback:row:35
+    - ocr_candidate:2:ocr_p2_fallback:row:37
+    - ocr_candidate:2:ocr_p2_fallback:row:40
     keep_after: ''
     keep_until: ''
     keep_numeric_rows_only: false
@@ -28,7 +29,7 @@ blocks:
     skip_dash_values: true
     selected_row_uids: *id001
   table_reconstruction: &id004
-    method: none
+    method: pair_name_row_with_following_value_row
   column_mapping: &id005
     column_1:
       role: code
@@ -39,6 +40,16 @@ blocks:
     column_3:
       role: unit
       output_field: unit
+    column_4:
+      role: value
+      output_field: value
+      metric: tariff
+      scenario: direct
+      tariff_type: direct
+      value_type: numeric
+      year: null
+      unit_override: null
+      currency_override: null
   source_kind: ocr_candidate
 tables:
 - section_name: user_profile_section
