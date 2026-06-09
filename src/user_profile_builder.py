@@ -805,6 +805,16 @@ def normalize_row_filters(row_filters: list[dict[str, Any]] | dict[str, Any] | N
         filters.append({"type": "skip_empty_value_columns"})
     if row_filters.get("skip_dash_values"):
         filters.append({"type": "skip_dash_values"})
+
+    # Support semantic include/exclude
+    include = row_filters.get("include")
+    if isinstance(include, dict) and (include.get("any") or include.get("all")):
+        filters.append({"type": "semantic_include", "config": include})
+
+    exclude = row_filters.get("exclude")
+    if isinstance(exclude, dict) and (exclude.get("any") or exclude.get("all")):
+        filters.append({"type": "semantic_exclude", "config": exclude})
+
     return filters
 
 
@@ -894,7 +904,62 @@ def apply_row_filters(
                     break
                 kept.append(row)
             result = kept
+        elif filter_type == "exclude_text_contains":
+            result = [
+                row
+                for row in result
+                if text.casefold() not in str(row.get("evidence_text") or "").casefold()
+            ]
+        elif filter_type == "keep_code_prefix":
+            result = [
+                row
+                for row in result
+                if str(row.get("evidence_text") or "").strip().startswith(text)
+            ]
+        elif filter_type == "exclude_code_prefix":
+            result = [
+                row
+                for row in result
+                if not str(row.get("evidence_text") or "").strip().startswith(text)
+            ]
+        elif filter_type == "semantic_include":
+            config = row_filter.get("config") or {}
+            any_conds = config.get("any") or []
+            all_conds = config.get("all") or []
+            
+            new_result = []
+            for row in result:
+                evidence = str(row.get("evidence_text") or "").casefold()
+                matches_any = not any_conds or any(_check_semantic_cond(evidence, cond) for cond in any_conds)
+                matches_all = not all_conds or all(_check_semantic_cond(evidence, cond) for cond in all_conds)
+                if matches_any and matches_all:
+                    new_result.append(row)
+            result = new_result
+        elif filter_type == "semantic_exclude":
+            config = row_filter.get("config") or {}
+            any_conds = config.get("any") or []
+            all_conds = config.get("all") or []
+            
+            new_result = []
+            for row in result:
+                evidence = str(row.get("evidence_text") or "").casefold()
+                matches_any = any_conds and any(_check_semantic_cond(evidence, cond) for cond in any_conds)
+                matches_all = all_conds and all(_check_semantic_cond(evidence, cond) for cond in all_conds)
+                if not (matches_any or (all_conds and matches_all)):
+                    new_result.append(row)
+            result = new_result
     return result
+
+
+def _check_semantic_cond(evidence: str, cond: dict[str, Any]) -> bool:
+    if not isinstance(cond, dict):
+        return False
+    if "contains" in cond:
+        return str(cond["contains"]).casefold() in evidence
+    if "code_prefix" in cond:
+        # Check both case-folded and original (code_prefix might be case-sensitive)
+        return evidence.strip().startswith(str(cond["code_prefix"]).casefold())
+    return False
 
 
 def _looks_like_section_title(evidence: str, cells: list[str]) -> bool:
@@ -1304,11 +1369,39 @@ def apply_user_profile(
         application_raw_rows = profile_raw_rows
         application_ocr_candidates = pd.DataFrame()
 
-    structured_rows = apply_user_profile_to_sources(
-        application_raw_rows,
-        application_ocr_candidates,
-        profile_config,
-    )
+    # Check for builtin parser bridge
+    parser_config = profile_config.get("parser")
+    if parser_config and parser_config.get("type") == "builtin":
+        parser_name = parser_config.get("name")
+        if parser_name == "fish_market_report":
+            from .parsers.fish_market_report import parse_fish_market_report
+            source_file = application_raw_rows["source_file"].iloc[0] if not application_raw_rows.empty else "unknown"
+            
+            parsed_pages = []
+            if not application_raw_rows.empty:
+                for page_number, group in application_raw_rows.groupby("page"):
+                    parsed_df = parse_fish_market_report(
+                        group["evidence_text"].fillna("").astype(str).tolist(),
+                        source_file=source_file,
+                        page=page_number,
+                        require_strong_markers=False, # Assume profile match is enough
+                        profile_markers_confirmed=True,
+                    )
+                    if not parsed_df.empty:
+                        parsed_pages.append(parsed_df)
+            
+            if parsed_pages:
+                structured_rows = pd.concat(parsed_pages, ignore_index=True)
+            else:
+                structured_rows = pd.DataFrame()
+        else:
+            structured_rows = pd.DataFrame()
+    else:
+        structured_rows = apply_user_profile_to_sources(
+            application_raw_rows,
+            application_ocr_candidates,
+            profile_config,
+        )
     rows_for_review = _rows_for_review(structured_rows)
     audit_trail = select_user_profile_export_columns(structured_rows)
     return {

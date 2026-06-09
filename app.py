@@ -51,6 +51,7 @@ from src.profile_draft import (
     dump_profile_draft_yaml,
 )
 from src.profile_parser_prototype import parse_sections_from_draft
+from src.llm_profile_generator import LLMProfileGenerator, validate_generated_profile
 from src.raw_table_analysis import build_raw_table_summary
 from src.source_registry import get_display_name, get_source_config, load_source_registry
 from src.user_profile_builder import (
@@ -1716,8 +1717,9 @@ PROFILE_BUILDER_STEPS = [
     "2. Таблицы/блоки",
     "3. Строки",
     "4. Колонки",
-    "5. Preview",
-    "6. Сохранение",
+    "5. LLM генератор",
+    "6. Preview",
+    "7. Сохранение",
 ]
 
 PROFILE_BUILDER_ROLE_OPTIONS = [
@@ -2940,6 +2942,18 @@ def main() -> None:
     if user_profile_candidates:
         applied_user_profile_config = user_profile_candidates[0]
         user_profile_apply_start_time = time.perf_counter()
+        
+        # Apply the profile (including running OCR if needed)
+        user_profile_result = apply_user_profile(
+            {"raw_rows": raw_rows, "ocr_candidates_df": ocr_candidates_df},
+            applied_user_profile_config,
+            ocr_runner=run_user_profile_ocr
+        )
+        user_profile_structured_df = user_profile_result["structured_rows"]
+        
+        # Update session state
+        st.session_state[user_profile_structured_key] = user_profile_structured_df
+        st.session_state[applied_user_profile_key] = applied_user_profile_config
         
         # Determine actual extraction strategy for display
         saved_profile_source = applied_user_profile_config.get("extraction", {}).get("source", "pdf_text_layer")
@@ -5091,15 +5105,101 @@ def main() -> None:
                                                 key=f"profile_builder_wizard_value_type:{document_key}:{column_index}",
                                             )
 
-                    elif wizard_step == "5. Preview":
-                        builder_profile_config = build_profile_builder_config(
-                            document_key,
-                            selected_builder_table_keys,
-                            selected_row_keys,
-                            max_builder_columns,
-                            use_token_mapping=token_mapping_mode,
-                            max_tokens=max_builder_tokens,
+                    elif wizard_step == "5. LLM генератор":
+                        st.subheader("Генерация профиля через LLM")
+                        st.write("Опишите, какие данные нужно извлечь из документа на естественном языке.")
+                        
+                        llm_instruction = st.text_area(
+                            "Инструкция для LLM",
+                            value=st.session_state.get(f"llm_profile_instruction:{document_key}", ""),
+                            placeholder="Мне нужны строки с зерновыми грузами на странице 2, кроме погрузки на автотранспорт. Извлеки код услуги, название услуги, единицу измерения и тариф. Валюта RUB.",
+                            key=f"llm_profile_instruction_input:{document_key}",
+                            height=150
                         )
+                        st.session_state[f"llm_profile_instruction:{document_key}"] = llm_instruction
+                        
+                        gen_cols = st.columns(2)
+                        target_pages = gen_cols[0].text_input("Страницы (например, 2 или 1,2,3)", value=st.session_state.get(f"llm_profile_pages:{document_key}", "2"), key=f"llm_profile_pages_input:{document_key}")
+                        st.session_state[f"llm_profile_pages:{document_key}"] = target_pages
+                        
+                        ocr_engine_llm = gen_cols[1].selectbox(
+                            "OCR Engine", 
+                            ["yandex_vision", "tesseract", "paddleocr"], 
+                            index=["yandex_vision", "tesseract", "paddleocr"].index(st.session_state.get(f"llm_profile_ocr_engine:{document_key}", "yandex_vision")),
+                            key=f"llm_profile_ocr_engine_input:{document_key}"
+                        )
+                        st.session_state[f"llm_profile_ocr_engine:{document_key}"] = ocr_engine_llm
+                        
+                        use_context = st.checkbox(
+                            "Использовать OCR контекст (рекомендуется)", 
+                            value=st.session_state.get(f"llm_profile_use_context:{document_key}", True),
+                            key=f"llm_profile_use_context_input:{document_key}"
+                        )
+                        st.session_state[f"llm_profile_use_context:{document_key}"] = use_context
+                        
+                        if st.button("Сгенерировать профиль через LLM", key=f"llm_profile_generate_btn:{document_key}", type="primary"):
+                            if not llm_instruction:
+                                st.error("Пожалуйста, введите инструкцию.")
+                            else:
+                                with st.spinner("LLM генерирует профиль..."):
+                                    try:
+                                        generator = LLMProfileGenerator()
+                                        
+                                        # Build document context
+                                        doc_context = {
+                                            "ocr_candidates_df": ocr_candidates_df,
+                                            "raw_rows": raw_table_rows
+                                        }
+                                        
+                                        # Mock existing schema for hint
+                                        existing_schema = build_profile_builder_config(
+                                            document_key,
+                                            selected_builder_table_keys,
+                                            selected_row_keys,
+                                            max_builder_columns,
+                                        )
+                                        
+                                        generated_profile = generator.generate_profile(
+                                            doc_context,
+                                            llm_instruction,
+                                            existing_schema=existing_schema
+                                        )
+                                        
+                                        # Validate
+                                        validation_errors = validate_generated_profile(generated_profile)
+                                        if validation_errors:
+                                            st.warning("Профиль сгенерирован с ошибками валидации:\n" + "\n".join(validation_errors))
+                                        
+                                        st.session_state[f"llm_generated_profile:{document_key}"] = generated_profile
+                                        st.success("Профиль успешно сгенерирован!")
+                                    except Exception as e:
+                                        st.error(f"Ошибка при генерации профиля: {e}")
+                                        
+                        generated_profile = st.session_state.get(f"llm_generated_profile:{document_key}")
+                        if generated_profile:
+                            st.subheader("Сгенерированный профиль")
+                            st.yaml(generated_profile)
+                            
+                            if st.button("Применить сгенерированный профиль", key=f"llm_profile_apply_btn:{document_key}"):
+                                # Mark LLM profile as active for preview/save
+                                st.session_state[f"llm_profile_active:{document_key}"] = True
+                                st.success("Профиль применён. Теперь вы можете проверить его на шаге Preview.")
+
+                    elif wizard_step == "6. Preview":
+                        llm_active = st.session_state.get(f"llm_profile_active:{document_key}", False)
+                        llm_profile = st.session_state.get(f"llm_generated_profile:{document_key}")
+                        
+                        if llm_active and llm_profile:
+                            builder_profile_config = llm_profile
+                        else:
+                            builder_profile_config = build_profile_builder_config(
+                                document_key,
+                                selected_builder_table_keys,
+                                selected_row_keys,
+                                max_builder_columns,
+                                use_token_mapping=token_mapping_mode,
+                                max_tokens=max_builder_tokens,
+                            )
                         builder_preview_df = apply_user_profile_to_sources(
                             raw_table_rows,
                             ocr_candidates_df,
@@ -5212,16 +5312,26 @@ def main() -> None:
                                 key=f"profile_builder_preview_csv:{document_key}",
                             )
 
-                    elif wizard_step == "6. Сохранение":
+                    elif wizard_step == "7. Сохранение":
                         profile_cols = st.columns(2)
+                        
+                        llm_active = st.session_state.get(f"llm_profile_active:{document_key}", False)
+                        llm_profile = st.session_state.get(f"llm_generated_profile:{document_key}")
+                        
+                        default_display = "Тарифы НМТП"
+                        default_name = "nmpt_tariffs"
+                        if llm_active and llm_profile:
+                            default_display = llm_profile.get("display_name", default_display)
+                            default_name = llm_profile.get("profile_name", default_name)
+
                         profile_cols[0].text_input(
                             "Название профиля",
-                            value=st.session_state.get(f"profile_builder_wizard_display:{document_key}", "Тарифы НМТП"),
+                            value=st.session_state.get(f"profile_builder_wizard_display:{document_key}", default_display),
                             key=f"profile_builder_wizard_display:{document_key}",
                         )
                         profile_cols[1].text_input(
                             "Техническое имя",
-                            value=st.session_state.get(f"profile_builder_wizard_name:{document_key}", "nmpt_tariffs"),
+                            value=st.session_state.get(f"profile_builder_wizard_name:{document_key}", default_name),
                             key=f"profile_builder_wizard_name:{document_key}",
                         )
                         st.text_area(
@@ -5243,14 +5353,17 @@ def main() -> None:
                             key=f"profile_builder_wizard_section:{document_key}",
                         )
 
-                        builder_profile_config = build_profile_builder_config(
-                            document_key,
-                            selected_builder_table_keys,
-                            selected_row_keys,
-                            max_builder_columns,
-                            use_token_mapping=token_mapping_mode,
-                            max_tokens=max_builder_tokens,
-                        )
+                        if llm_active and llm_profile:
+                            builder_profile_config = llm_profile
+                        else:
+                            builder_profile_config = build_profile_builder_config(
+                                document_key,
+                                selected_builder_table_keys,
+                                selected_row_keys,
+                                max_builder_columns,
+                                use_token_mapping=token_mapping_mode,
+                                max_tokens=max_builder_tokens,
+                            )
                         builder_preview_df = apply_user_profile_to_sources(
                             raw_table_rows,
                             ocr_candidates_df,
